@@ -6,7 +6,7 @@ the view map, layout book, property definitions, classifications and standards) 
 
 It talks to Archicad's JSON API (Archicad 24 and later) over http://127.0.0.1:<port>, with the Python standard library
 only, so it runs in Archicad's Python palette and from a terminal without installing anything. It never reads .pln /
-.tpl files itself and uses no Graphisoft or ODA SDK. Format: FORMAT.md (cadcraft-project-bundle 1).
+.tpl files itself and uses no Graphisoft or ODA SDK. Format: docs/spikes/archicad-bundle.md (cadcraft-project-bundle 1).
 
     python archicad_bundle.py --probe                 # step 1: which API commands this Archicad answers → probe.json
     python archicad_bundle.py --out C:/bundles        # the bundle, published with the publisher set "CadCraft bundle"
@@ -358,18 +358,42 @@ def clean(x):
 
 # ---- publishing and packing ----
 
-def publish(ac, set_name, folder, notes):
-    """Publish the set into `folder` → the files it wrote."""
-    before = set()
-    ac.call("PublishPublisherSet", {"publisherSetName": set_name, "outputPath": folder})
+PUBLISH_WAIT = 20   # seconds to keep watching a folder for files that arrive after Archicad has answered (--wait)
+
+
+def _files_in(folder, since=None):
     found = []
     for root, _, files in os.walk(folder):
         for f in files:
             p = os.path.join(root, f)
-            if p not in before:
-                found.append(p)
+            try:
+                if since is None or os.path.getmtime(p) >= since - 2:
+                    found.append(p)
+            except OSError:
+                continue
+    return found
+
+
+def publish(ac, set_name, folder, notes, own_folder=False, wait=None):
+    """Publish the set into `folder` → the files it wrote. Archicad is given the real path (no symlinks, no trailing slash) and
+    the folder is watched for up to `wait` seconds, in case the files land after the command has answered. With `own_folder`
+    the set's own saved destination is used (no outputPath is sent) and `folder` is where that destination is: only files
+    written since the command started count."""
+    wait = PUBLISH_WAIT if wait is None else wait
+    t0 = time.time()
+    params = {"publisherSetName": set_name}
+    if not own_folder:
+        folder = os.path.realpath(folder)
+        params["outputPath"] = folder
+    reply = ac.call("PublishPublisherSet", params)
+    found = _files_in(folder, t0 if own_folder else None)
+    deadline = time.time() + wait
+    while not found and time.time() < deadline:
+        time.sleep(1)
+        found = _files_in(folder, t0 if own_folder else None)
     if not found:
-        notes.append("The publisher set \"%s\" wrote no files into %s." % (set_name, folder))
+        notes.append("The publisher set \"%s\" wrote no files into %s (Archicad answered: %s)."
+                     % (set_name, folder, json.dumps(reply, ensure_ascii=False)[:300] if reply else "an empty reply"))
     return found
 
 
@@ -465,7 +489,7 @@ def probe(ac):
         except ApiError as e:
             results["Tapir." + name] = {"ok": False, "error": e.code, "message": e.message}
     return {"format": "cadcraft-archicad-probe", "version": 1, "tool": VERSION, "port": ac.port,
-            "when": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "results": results, "calls": ac.calls}
+            "when": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z", "results": results, "calls": ac.calls}
 
 
 def build(ac, args):
@@ -481,7 +505,7 @@ def build(ac, args):
                       "host": clean({"program": "Archicad", "version": str(info.get("version", "")), "build": str(info.get("buildNumber", "")),
                                      "language": info.get("languageCode")})},
         "project": clean({"name": args.name or proj.get("projectName") or "Project", "file": os.path.basename(proj.get("projectPath") or ""),
-                          "kind": args.kind, "exported_at": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}),
+                          "kind": args.kind, "exported_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z"}),
         "model": {"file": "model/model.ifc", "translator": args.translator, "guids": "kept"},
         "stories": stories, "views": views, "layouts": lay[0], "masters": lay[1],
         "properties": collect_properties(ac, notes), "classifications": collect_classifications(ac, notes),
@@ -491,11 +515,39 @@ def build(ac, args):
     try:
         published = [] if args.no_publish else (safe(lambda: publish(ac, args.publisher_set, work, notes), notes,
                                                      "Publishing \"%s\"" % args.publisher_set) or [])
+        if not args.no_publish and not published:
+            # Archicad may not be able to write into the system temp folder (permissions, sandboxing): try beside the bundle.
+            retry = tempfile.mkdtemp(prefix="cc-bundle-", dir=os.path.abspath(args.out))
+            try:
+                published = safe(lambda: publish(ac, args.publisher_set, retry, notes), notes,
+                                 "Publishing \"%s\" into %s" % (args.publisher_set, retry)) or []
+                if published:   # the files must outlive this block: move them to the main work folder
+                    moved = []
+                    for p in published:
+                        dst = os.path.join(work, os.path.relpath(p, retry))
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.move(p, dst)
+                        moved.append(dst)
+                    published = moved
+            finally:
+                shutil.rmtree(retry, ignore_errors=True)
+        if not args.no_publish and not published and args.publish_dir:
+            # The set keeps its own destination (its "Save to" folder): publish without an output path and pick up what lands there.
+            own = safe(lambda: publish(ac, args.publisher_set, args.publish_dir, notes, own_folder=True), notes,
+                       "Publishing \"%s\" into its own folder %s" % (args.publisher_set, args.publish_dir)) or []
+            for p in own:
+                dst = os.path.join(work, os.path.relpath(p, args.publish_dir))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(p, dst)
+                published.append(dst)
         if args.files:
             published += [os.path.abspath(p) for p in args.files]
         if not any(p.lower().endswith(".ifc") for p in published):
+            seen = sorted({os.path.splitext(p)[1].lower() or "(no extension)" for p in published})
             raise SystemExit("No IFC file was published. Check the publisher set \"%s\" has the model as IFC (README.md, Use step 2), "
-                             "or pass the IFC with --files." % args.publisher_set)
+                             "or pass the IFC with --files, or --publish-dir <the set's own Save-to folder>.\nFiles the set wrote: %s\n%s"
+                             % (args.publisher_set, ", ".join(seen) if seen else "none (the IFC must be a plain .ifc, not .ifcZIP or .ifcXML)",
+                                "\n".join("Note: " + n for n in notes)))
         out = os.path.join(args.out, slug(manifest["project"]["name"]) + ".ccbundle.zip")
         final = clean(manifest)
         final["notes"] = notes
@@ -513,12 +565,16 @@ def main(argv=None):
     ap.add_argument("--port", type=int, help="Archicad's JSON API port (default: the first that answers from 19723)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--publisher-set", default="CadCraft bundle", help="the publisher set that writes IFC + layout PDFs + DWGs")
+    ap.add_argument("--publish-dir", help="the folder the publisher set saves to itself (its own Save-to destination); used when publishing into a folder of ours writes nothing")
+    ap.add_argument("--wait", type=int, default=20, help="seconds to keep watching for published files after Archicad answers (default 20)")
     ap.add_argument("--no-publish", action="store_true", help="do not publish; use --files instead")
     ap.add_argument("--files", nargs="*", help="files already exported (IFC, layout PDFs/DWGs) to pack")
     ap.add_argument("--name", help="project name (default: from Archicad)")
     ap.add_argument("--kind", choices=["project", "archive", "template"], default="project")
     ap.add_argument("--translator", default=None, help="the IFC translator's name, written into the manifest")
     args = ap.parse_args(argv)
+    global PUBLISH_WAIT
+    PUBLISH_WAIT = max(0, args.wait)
     ac = Archicad(args.port, args.host)
     os.makedirs(args.out, exist_ok=True)
     if args.probe:

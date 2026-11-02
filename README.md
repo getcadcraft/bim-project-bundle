@@ -77,13 +77,15 @@ python archicad_bundle.py --out . --no-publish --files <folder>\*.ifc <folder>\*
 | `--translator "<name>"` | the IFC translator you picked, recorded in the manifest |
 | `--publisher-set "<name>"` | a set with another name than "CadCraft bundle" |
 | `--port <n>` | Archicad's JSON API port (default: the first that answers from 19723) |
+| `--publish-dir <folder>` | the folder the set saves to itself (its *Save to* destination); tried when publishing into our own folders writes nothing |
+| `--wait <seconds>` | how long to keep watching for files that arrive after Archicad has answered (default 20) |
 | `--no-publish --files …` | pack files you exported yourself |
 | `--name "<name>"` | project name (default: from Archicad) |
 | `--kind project\|archive\|template` | what the bundle came from; a template's bundle mainly carries its standards |
 
 ### Messages
 
-- **"No IFC file was published"**: the set has no IFC item (step 2), or another name (use `--publisher-set`).
+- **"No IFC file was published"**: the set has no IFC item (step 2), or another name (use `--publisher-set`), or it saves the IFC as IFC zip / IFC XML (the bundle needs a plain `.ifc`). The message lists the file types the set did write and what Archicad answered. The script tries a temporary folder, then a folder beside the bundle; if the set keeps its own *Save to* folder, run again with `--publish-dir <that folder>`.
 - **No JSON API answers**: Archicad is not open, or it is older than 24.
 
 ## Format
